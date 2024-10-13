@@ -1,364 +1,8 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# File name          : DescribeNTSecurityDescriptor.py
-# Author             : Podalirius (@podalirius_)
-# Date created       : 20 Nov 2023
+import io,re,struct,random,binascii
+from enums import *
+from IntFlags import *
+import pandas as pd
 
-import argparse
-import binascii
-from enum import Enum, IntFlag
-import io
-import ldap3
-from ldap3.protocol.formatters.formatters import format_sid
-from sectools.windows.ldap import raw_ldap_query, init_ldap_session
-from sectools.windows.crypto import nt_hash, parse_lm_nt_hashes
-import os
-import random
-import re
-import struct
-import sys
-
-
-VERSION = "1.2"
-
-
-# LDAP controls
-# https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/3c5e87db-4728-4f29-b164-01dd7d7391ea
-LDAP_PAGED_RESULT_OID_STRING = "1.2.840.113556.1.4.319"
-# https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/f14f3610-ee22-4d07-8a24-1bf1466cba5f
-LDAP_SERVER_NOTIFICATION_OID = "1.2.840.113556.1.4.528"
-
-
-class LDAPSearcher(object):
-    """
-    LDAPSearcher is a utility class designed to facilitate the execution of LDAP queries against an LDAP server.
-    It encapsulates the details of establishing a session with an LDAP server, constructing and executing queries,
-    and processing the results. This class aims to simplify LDAP interactions, making it easier to retrieve and
-    manipulate directory information.
-
-    Attributes:
-        ldap_server (str): The address of the LDAP server to connect to.
-        ldap_session (ldap3.Connection): An established session with the LDAP server.
-        debug (bool): A flag indicating whether to output debug information.
-
-    Methods:
-        query(base_dn, query, attributes, page_size): Executes an LDAP query and returns the results.
-    """
-
-    schemaIDGUID = {}
-
-    def __init__(self, ldap_server, ldap_session, debug=False):
-        super(LDAPSearcher, self).__init__()
-        self.ldap_server = ldap_server
-        self.ldap_session = ldap_session
-        self.debug = debug
-
-    def query(self, base_dn, query, attributes=['*'], page_size=1000):
-        """
-        Executes an LDAP query with optional notification control.
-
-        This method performs an LDAP search operation based on the provided query and attributes. It supports
-        pagination to handle large datasets and can optionally enable notification control to receive updates
-        about changes in the LDAP directory.
-
-        Parameters:
-        - query (str): The LDAP query string.
-        - attributes (list of str): A list of attribute names to include in the search results. Defaults to ['*'], which returns all attributes.
-        - notify (bool): If True, enables the LDAP server notification control to receive updates about changes. Defaults to False.
-
-        Returns:
-        - dict: A dictionary where each key is a distinguished name (DN) and each value is a dictionary of attributes for that DN.
-
-        Raises:
-        - ldap3.core.exceptions.LDAPInvalidFilterError: If the provided query string is not a valid LDAP filter.
-        - Exception: For any other issues encountered during the search operation.
-        """
-
-        results = {}
-        try:
-            # https://ldap3.readthedocs.io/en/latest/searches.html#the-search-operation
-            paged_response = True
-            paged_cookie = None
-            while paged_response == True:
-                self.ldap_session.search(
-                    base_dn,
-                    query,
-                    attributes=attributes,
-                    size_limit=0,
-                    paged_size=page_size,
-                    paged_cookie=paged_cookie
-                )
-                if "controls" in self.ldap_session.result.keys():
-                    if LDAP_PAGED_RESULT_OID_STRING in self.ldap_session.result["controls"].keys():
-                        next_cookie = self.ldap_session.result["controls"][LDAP_PAGED_RESULT_OID_STRING]["value"]["cookie"]
-                        if len(next_cookie) == 0:
-                            paged_response = False
-                        else:
-                            paged_response = True
-                            paged_cookie = next_cookie
-                    else:
-                        paged_response = False
-                else:
-                    paged_response = False
-                for entry in self.ldap_session.response:
-                    if entry['type'] != 'searchResEntry':
-                        continue
-                    results[entry['dn'].lower()] = entry["attributes"]
-        except ldap3.core.exceptions.LDAPInvalidFilterError as e:
-            print("Invalid Filter. (ldap3.core.exceptions.LDAPInvalidFilterError)")
-        except Exception as e:
-            raise e
-        return results
-
-    def query_all_naming_contexts(self, query, attributes=['*'], page_size=1000):
-        """
-        Queries all naming contexts on the LDAP server with the given query and attributes.
-
-        This method iterates over all naming contexts retrieved from the LDAP server's information,
-        performing a paged search for each context using the provided query and attributes. The results
-        are aggregated and returned as a dictionary where each key is a distinguished name (DN) and
-        each value is a dictionary of attributes for that DN.
-
-        Parameters:
-        - query (str): The LDAP query to execute.
-        - attributes (list of str): A list of attribute names to retrieve for each entry. Defaults to ['*'] which fetches all attributes.
-
-        Returns:
-        - dict: A dictionary where each key is a DN and each value is a dictionary of attributes for that DN.
-        """
-
-        results = {}
-        try:
-            for naming_context in self.ldap_server.info.naming_contexts:
-                paged_response = True
-                paged_cookie = None
-                while paged_response == True:
-                    self.ldap_session.search(
-                        naming_context,
-                        query,
-                        attributes=attributes,
-                        size_limit=0,
-                        paged_size=page_size,
-                        paged_cookie=paged_cookie
-                    )
-                    if "controls" in self.ldap_session.result.keys():
-                        if LDAP_PAGED_RESULT_OID_STRING in self.ldap_session.result["controls"].keys():
-                            next_cookie = self.ldap_session.result["controls"][LDAP_PAGED_RESULT_OID_STRING]["value"]["cookie"]
-                            if len(next_cookie) == 0:
-                                paged_response = False
-                            else:
-                                paged_response = True
-                                paged_cookie = next_cookie
-                        else:
-                            paged_response = False
-                    else:
-                        paged_response = False
-                    for entry in self.ldap_session.response:
-                        if entry['type'] != 'searchResEntry':
-                            continue
-                        results[entry['dn']] = entry["attributes"]
-        except ldap3.core.exceptions.LDAPInvalidFilterError as e:
-            print("Invalid Filter. (ldap3.core.exceptions.LDAPInvalidFilterError)")
-        except Exception as e:
-            raise e
-        return results
-
-    def generate_guid_map_from_ldap(self):
-        if self.debug:
-            print("[>] Extracting the list of schemaIDGUID ...")
-
-        results = self.query(
-            base_dn=self.ldap_server.info.other["schemaNamingContext"],
-            query="(schemaIDGUID=*)",
-            attributes=["*"]
-        )
-
-        self.schemaIDGUID = {}
-        for distinguishedName in results.keys():
-            __guid = GUID.load(data=results[distinguishedName]["schemaIDGUID"])
-            self.schemaIDGUID[__guid.toFormatD()] = results[distinguishedName]
-            self.schemaIDGUID[__guid.toFormatD()]["distinguishedName"] = distinguishedName
-
-        if self.debug:
-            print("[>] done.")
-
-
-class PropertySet(Enum):
-    """
-    PropertySet is an enumeration of GUIDs representing various property sets in Active Directory.
-    These property sets group related properties of AD objects, making it easier to manage and apply permissions to these properties.
-    Each entry in this enumeration maps a human-readable name to the corresponding GUID of the property set.
-    These GUIDs are used in Access Control Entries (ACEs) to grant or deny permissions to read or write a set of properties on AD objects.
-
-    The GUIDs are defined by Microsoft and can be found in the Microsoft documentation and technical specifications.
-    Property sets are a crucial part of the Active Directory schema and help in defining the security model by allowing fine-grained access control.
-
-    https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/177c0db5-fa12-4c31-b75a-473425ce9cca
-    """
-    DOMAIN_PASSWORD_AND_LOCKOUT_POLICIES = "c7407360-20bf-11d0-a768-00aa006e0529"
-    GENERAL_INFORMATION = "59ba2f42-79a2-11d0-9020-00c04fc2d3cf"
-    ACCOUNT_RESTRICTIONS = "4c164200-20c0-11d0-a768-00aa006e0529"
-    LOGON_INFORMATION = "5f202010-79a5-11d0-9020-00c04fc2d4cf"
-    GROUP_MEMBERSHIP = "bc0ac240-79a9-11d0-9020-00c04fc2d4cf"
-    PHONE_AND_MAIL_OPTIONS = "e45795b2-9455-11d1-aebd-0000f80367c1"
-    PERSONAL_INFORMATION = "77b5b886-944a-11d1-aebd-0000f80367c1"
-    WEB_INFORMATION = "e45795b3-9455-11d1-aebd-0000f80367c1"
-    PUBLIC_INFORMATION = "e48d0154-bcf8-11d1-8702-00c04fb96050"
-    REMOTE_ACCESS_INFORMATION = "037088f8-0ae1-11d2-b422-00a0c968f939"
-    OTHER_DOMAIN_PARAMETERS_FOR_USE_BY_SAM = "b8119fd0-04f6-4762-ab7a-4986c76b3f9a"
-    DNS_HOST_NAME_ATTRIBUTES = "72e39547-7b18-11d1-adef-00c04fd8d5cd"
-    MS_TS_GATEWAYACCESS = "ffa6f046-ca4b-4feb-b40d-04dfee722543"
-    PRIVATE_INFORMATION = "91e647de-d96f-4b70-9557-d63ff4f3ccd8"
-    TERMINAL_SERVER_LICENSE_SERVER = "5805bc62-bdc9-4428-a5e2-856a0f4c185e"
-
-
-class ExtendedRights(Enum):
-    """
-    ExtendedRights is an enumeration of GUIDs representing various extended rights in Active Directory.
-    These rights are associated with specific operations that can be performed on AD objects.
-    Each entry in this enumeration maps a human-readable name to the corresponding GUID of the extended right.
-    These GUIDs are used in Access Control Entries (ACEs) to grant or deny these rights to security principals (users, groups, etc.).
-
-    The rights include, but are not limited to, the ability to create or delete specific types of child objects,
-    force password resets, read/write specific properties, and more. They play a crucial role in defining
-    the security model of Active Directory by allowing fine-grained access control to objects.
-
-    The GUIDs are defined by Microsoft and can be found in the Microsoft documentation and technical specifications.
-
-    https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/443fe66f-c9b7-4c50-8c24-c708692bbf1d
-    """
-
-    # 
-    ABANDON_REPLICATION = "ee914b82-0a98-11d1-adbb-00c04fd8d5cd"
-	#
-    ADD_GUID = "440820ad-65b4-11d1-a3da-0000f875ae0d"
-	#
-    ALLOCATE_RIDS = "1abd7cf8-0a99-11d1-adbb-00c04fd8d5cd"
-	#
-    ALLOWED_TO_AUTHENTICATE = "68b1d179-0d15-4d4f-ab71-46152e79a7bc"
-	#
-    APPLY_GROUP_POLICY = "edacfd8f-ffb3-11d1-b41d-00a0c968f939"
-    # 
-    CERTIFICATE_ENROLLMENT = "0e10c968-78fb-11d2-90d4-00c04f79dc55"
-	# 
-    CHANGE_DOMAIN_MASTER = "014bf69c-7b3b-11d1-85f6-08002be74fab"
-	# 
-    CHANGE_INFRASTRUCTURE_MASTER = "cc17b1fb-33d9-11d2-97d4-00c04fd8d5cd"
-	# 
-    CHANGE_PDC = "bae50096-4752-11d1-9052-00c04fc2d4cf"
-    # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/fcb2b5e7-302f-43cb-8adf-4c9cd9423178
-    CHANGE_RID_MASTER = "d58d5f36-0a98-11d1-adbb-00c04fd8d5cd"
-	# 
-    CHANGE_SCHEMA_MASTER = "e12b56b6-0a95-11d1-adbb-00c04fd8d5cd"
-	# 
-    CREATE_INBOUND_FOREST_TRUST = "e2a36dc9-ae17-47c3-b58b-be34c55ba633"
-	# 
-    DO_GARBAGE_COLLECTION = "fec364e0-0a98-11d1-adbb-00c04fd8d5cd"
-	# 
-    DOMAIN_ADMINISTER_SERVER = "ab721a52-1e2f-11d0-9819-00aa0040529b"
-	# 
-    DS_CHECK_STALE_PHANTOMS = "69ae6200-7f46-11d2-b9ad-00c04f79f805"
-	# 
-    DS_CLONE_DOMAIN_CONTROLLER = "3e0f7e18-2c7a-4c10-ba82-4d926db99a3e"
-	# 
-    DS_EXECUTE_INTENTIONS_SCRIPT = "2f16c4a5-b98e-432c-952a-cb388ba33f2e"
-	# 
-    DS_INSTALL_REPLICA = "9923a32a-3607-11d2-b9be-0000f87a36b2"
-	# 
-    DS_QUERY_SELF_QUOTA = "4ecc03fe-ffc0-4947-b630-eb672a8a9dbc"
-	# 
-    DS_REPLICATION_GET_CHANGES = "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"
-	# 
-    DS_REPLICATION_GET_CHANGES_ALL = "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
-	# 
-    DS_REPLICATION_GET_CHANGES_IN_FILTERED_SET = "89e95b76-444d-4c62-991a-0facbeda640c"
-	# 
-    DS_REPLICATION_MANAGE_TOPOLOGY = "1131f6ac-9c07-11d1-f79f-00c04fc2dcd2"
-	# 
-    DS_REPLICATION_MONITOR_TOPOLOGY = "f98340fb-7c5b-4cdb-a00b-2ebdfa115a96"
-	# 
-    DS_REPLICATION_SYNCHRONIZE = "1131f6ab-9c07-11d1-f79f-00c04fc2dcd2"
-	# 
-    ENABLE_PER_USER_REVERSIBLY_ENCRYPTED_PASSWORD = "05c74c5e-4deb-43b4-bd9f-86664c2a7fd5"
-	# 
-    GENERATE_RSOP_LOGGING = "b7b1b3de-ab09-4242-9e30-9980e5d322f7"
-	# 
-    GENERATE_RSOP_PLANNING = "b7b1b3dd-ab09-4242-9e30-9980e5d322f7"
-	# 
-    MANAGE_OPTIONAL_FEATURES = "7c0e2a7c-a419-48e4-a995-10180aad54dd"
-	# 
-    MIGRATE_SID_HISTORY = "ba33815a-4f93-4c76-87f3-57574bff8109"
-	# 
-    MSMQ_OPEN_CONNECTOR = "b4e60130-df3f-11d1-9c86-006008764d0e"
-	# 
-    MSMQ_PEEK = "06bd3201-df3e-11d1-9c86-006008764d0e"
-	# 
-    MSMQ_PEEK_COMPUTER_JOURNAL = "4b6e08c3-df3c-11d1-9c86-006008764d0e"
-	# 
-    MSMQ_PEEK_DEAD_LETTER = "4b6e08c1-df3c-11d1-9c86-006008764d0e"
-	# 
-    MSMQ_RECEIVE = "06bd3200-df3e-11d1-9c86-006008764d0e"
-	# 
-    MSMQ_RECEIVE_COMPUTER_JOURNAL = "4b6e08c2-df3c-11d1-9c86-006008764d0e"
-	# 
-    MSMQ_RECEIVE_DEAD_LETTER = "4b6e08c0-df3c-11d1-9c86-006008764d0e"
-	# 
-    MSMQ_RECEIVE_JOURNAL = "06bd3203-df3e-11d1-9c86-006008764d0e"
-	# 
-    MSMQ_SEND = "06bd3202-df3e-11d1-9c86-006008764d0e"
-	# 
-    OPEN_ADDRESS_BOOK = "a1990816-4298-11d1-ade2-00c04fd8d5cd"
-	# 
-    READ_ONLY_REPLICATION_SECRET_SYNCHRONIZATION = "1131f6ae-9c07-11d1-f79f-00c04fc2dcd2"
-	# 
-    REANIMATE_TOMBSTONES = "45ec5156-db7e-47bb-b53f-dbeb2d03c40f"
-	# 
-    RECALCULATE_HIERARCHY = "0bc1554e-0a99-11d1-adbb-00c04fd8d5cd"
-	# 
-    RECALCULATE_SECURITY_INHERITANCE = "62dd28a8-7f46-11d2-b9ad-00c04f79f805"
-	# 
-    RECEIVE_AS = "ab721a56-1e2f-11d0-9819-00aa0040529b"
-	# 
-    REFRESH_GROUP_CACHE = "9432c620-033c-4db7-8b58-14ef6d0bf477"
-	# 
-    RELOAD_SSL_CERTIFICATE = "1a60ea8d-58a6-4b20-bcdc-fb71eb8a9ff8"
-	# 
-    RUN_PROTECT_ADMIN_GROUPS_TASK = "7726b9d5-a4b4-4288-a6b2-dce952e80a7f"
-	# 
-    SAM_ENUMERATE_ENTIRE_DOMAIN = "91d67418-0135-4acc-8d79-c08e857cfbec"
-	# 
-    SEND_AS = "ab721a54-1e2f-11d0-9819-00aa0040529b"
-	# 
-    SEND_TO = "ab721a55-1e2f-11d0-9819-00aa0040529b"
-	# 
-    UNEXPIRE_PASSWORD = "ccc2dc7d-a6ad-4a7a-8846-c04e3cc53501"
-	# 
-    UPDATE_PASSWORD_NOT_REQUIRED_BIT = "280f369c-67c7-438e-ae98-1d46f3c6f541"
-	# 
-    UPDATE_SCHEMA_CACHE = "be2bb760-7f46-11d2-b9ad-00c04f79f805"
-	# 
-    USER_CHANGE_PASSWORD = "ab721a53-1e2f-11d0-9819-00aa0040529b"
-	# 
-    USER_FORCE_CHANGE_PASSWORD = "00299570-246d-11d0-a768-00aa006e0529"
-
-
-## SID 
-
-
-class SID_IDENTIFIER_AUTHORITY(Enum):
-    """
-    Source: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/c6ce4275-3d90-4890-ab3a-514745e4637e
-    """
-    NULL_SID_AUTHORITY = 0x00
-    WORLD_SID_AUTHORITY = 0x01
-    LOCAL_SID_AUTHORITY = 0x02
-    CREATOR_SID_AUTHORITY = 0x03
-    NON_UNIQUE_AUTHORITY = 0x04
-    SECURITY_NT_AUTHORITY = 0x05
-    SECURITY_APP_PACKAGE_AUTHORITY = 0x0f
-    SECURITY_MANDATORY_LABEL_AUTHORITY = 0x10
-    SECURITY_SCOPED_POLICY_ID_AUTHORITY = 0x11
-    SECURITY_AUTHENTICATION_AUTHORITY = 0x12
 
 
 class SID(object):
@@ -584,53 +228,18 @@ class SID(object):
 
     def describe(self, offset=0, indent=0):
         indent_prompt = " │ " * indent
-        print("%s<SID at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))
+        print("%s<SID at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))
         str_repr = self.toString()
         if str_repr not in self.wellKnownSIDs.keys():
-            print("%s │ \x1b[93mSID\x1b[0m : \x1b[96m%s\x1b[0m" % (indent_prompt, str_repr))
+            print("%s │ SID : %s" % (indent_prompt, str_repr))
         else:
-            print("%s │ \x1b[93mSID\x1b[0m : \x1b[96m%s\x1b[0m (\x1b[94m%s\x1b[0m)" % (indent_prompt, str_repr, self.wellKnownSIDs[str_repr]))
-        print(''.join([" │ "]*indent + [" └─"]))    
-
-# Aliases
+            print("%s │ SID : %s (%s)" % (indent_prompt, str_repr, self.wellKnownSIDs[str_repr]))
+        #print(''.join([" │ "]*indent + [" └─"])) 
 
 SecurityIdentifier = SID
 
-## GUID
-
-class GUIDFormat(Enum):
-    """
-    N => 32 digits : 00000000000000000000000000000000
-    D => 32 digits separated by hyphens : 00000000-0000-0000-0000-000000000000
-    B => 32 digits separated by hyphens, enclosed in braces : {00000000-0000-0000-0000-000000000000}
-    P => 32 digits separated by hyphens, enclosed in parentheses : (00000000-0000-0000-0000-000000000000)
-    X => Four hexadecimal values enclosed in braces, where the fourth value is a subset of eight hexadecimal values that is also enclosed in braces : {0x00000000,0x0000,0x0000,{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}}
-    """
-    N = 0
-    D = 1
-    B = 2
-    P = 3
-    X = 4
-
-
-class GUIDImportFormatPattern(Enum):
-    """
-    N => 32 digits : 00000000000000000000000000000000
-    D => 32 digits separated by hyphens : 00000000-0000-0000-0000-000000000000
-    B => 32 digits separated by hyphens, enclosed in braces : {00000000-0000-0000-0000-000000000000}
-    P => 32 digits separated by hyphens, enclosed in parentheses : (00000000-0000-0000-0000-000000000000)
-    X => Four hexadecimal values enclosed in braces, where the fourth value is a subset of eight hexadecimal values that is also enclosed in braces : {0x00000000,0x0000,0x0000,{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}}
-    """
-    N = "^([0-9a-f]{8})([0-9a-f]{4})([0-9a-f]{4})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$"
-    D = "^([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})$"
-    B = "^{([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})}$"
-    P = "^\\(([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})\\)$"
-    X = "^{0x([0-9a-f]{8}),0x([0-9a-f]{4}),0x([0-9a-f]{4}),{0x([0-9a-f]{2}),0x([0-9a-f]{2}),0x([0-9a-f]{2}),0x([0-9a-f]{2}),0x([0-9a-f]{2}),0x([0-9a-f]{2}),0x([0-9a-f]{2}),0x([0-9a-f]{2})}}$"
-
-
 class InvalidGUIDFormat(Exception):
     pass
-
 
 class GUID(object):
     """
@@ -889,33 +498,13 @@ class OwnerSID(object):
         if __sid_str_repr in self.sid.wellKnownSIDs.keys():
             self.displayName = self.sid.wellKnownSIDs[__sid_str_repr]
         
-        # Try to resolve it from the LDAP
-        if self.displayName is None:
-            if self.ldap_searcher is not None:
-                search_base = ldap_server.info.other["defaultNamingContext"][0]
-                __ldap_results = self.ldap_searcher.query(
-                    base_dn=search_base,
-                    query="(objectSid=%s)" % self.sid.toString(),
-                    attributes=["sAMAccountName"]
-                )
-                if len(__ldap_results.keys()) != 0:
-                    __dn = list(__ldap_results.keys())[0].upper()
-                    __dc_string = "DC=" + __dn.split(',DC=',1)[1]
-                    __domain = '.'.join([dc.replace('DC=','',1) for dc in __dc_string.split(',')])
-                    self.displayName = "%s\\%s" % (__domain, __ldap_results[__dn.lower()]["sAMAccountName"])
-
         if self.verbose:
             self.describe()
 
     def describe(self, offset=0, indent=0):
         indent_prompt = " │ " * indent
-        print("%s<OwnerSID at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))
-        str_repr = self.sid.toString()
-        if self.displayName is not None:
-            print("%s │ \x1b[93mSID\x1b[0m : \x1b[96m%s\x1b[0m (\x1b[94m%s\x1b[0m)" % (indent_prompt, self.sid.toString(), self.displayName))
-        else:
-            print("%s │ \x1b[93mSID\x1b[0m : \x1b[96m%s\x1b[0m" % (indent_prompt, self.sid.toString()))
-        print(''.join([" │ "]*indent + [" └─"]))
+        print("%s<OwnerSID at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))
+        #print(''.join([" │ "]*indent + [" └─"]))
 
 
 class GroupSID(object):
@@ -958,32 +547,18 @@ class GroupSID(object):
         if __sid_str_repr in self.sid.wellKnownSIDs.keys():
             self.displayName = self.sid.wellKnownSIDs[__sid_str_repr]
         
-        # Try to resolve it from the LDAP
-        if self.displayName is None:
-            if self.ldap_searcher is not None:
-                search_base = ldap_server.info.other["defaultNamingContext"][0]
-                __ldap_results = self.ldap_searcher.query(
-                    base_dn=search_base,
-                    query="(objectSid=%s)" % self.sid.toString(),
-                    attributes=["sAMAccountName"]
-                )
-                if len(__ldap_results.keys()) != 0:
-                    __dn = list(__ldap_results.keys())[0].upper()
-                    __dc_string = "DC=" + __dn.split(',DC=',1)[1]
-                    __domain = '.'.join([dc.replace('DC=','',1) for dc in __dc_string.split(',')])
-                    self.displayName = "%s\\%s" % (__domain, __ldap_results[__dn.lower()]["sAMAccountName"])
 
         if self.verbose:
             self.describe()
 
     def describe(self, offset=0, indent=0):
         indent_prompt = " │ " * indent
-        print("%s<GroupSID at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))
+        print("%s<GroupSID at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))
         if self.displayName is not None:
-            print("%s │ \x1b[93mSID\x1b[0m : \x1b[96m%s\x1b[0m (\x1b[94m%s\x1b[0m)" % (indent_prompt, self.sid.toString(), self.displayName))
+            print("%s │ SID : %s (%s)" % (indent_prompt, self.sid.toString(), self.displayName))
         else:
-            print("%s │ \x1b[93mSID\x1b[0m : \x1b[96m%s\x1b[0m" % (indent_prompt, self.sid.toString()))
-        print(''.join([" │ "]*indent + [" └─"]))
+            print("%s │ SID : %s" % (indent_prompt, self.sid.toString()))
+        #print(''.join([" │ "]*indent + [" └─"]))
 
 
 class ACESID(object):
@@ -1027,6 +602,7 @@ class ACESID(object):
             self.displayName = self.sid.wellKnownSIDs[__sid_str_repr]
         
         # Try to resolve it from the LDAP
+        '''
         if self.displayName is None:
             if self.ldap_searcher is not None:
                 search_base = ldap_server.info.other["defaultNamingContext"][0]
@@ -1040,32 +616,53 @@ class ACESID(object):
                     __dc_string = "DC=" + __dn.split(',DC=',1)[1]
                     __domain = '.'.join([dc.replace('DC=','',1) for dc in __dc_string.split(',')])
                     self.displayName = "%s\\%s" % (__domain, __ldap_results[__dn.lower()]["sAMAccountName"])
+        '''
 
         # 
         if self.verbose:
             self.describe()
 
     def describe(self, offset=0, indent=0):
+        '''
         indent_prompt = " │ " * indent
-        print("%s<ACESID at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))
+        print("%s<ACESID at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))
         if self.displayName is not None:
-            print("%s │ \x1b[93mSID\x1b[0m : \x1b[96m%s\x1b[0m (\x1b[94m%s\x1b[0m)" % (indent_prompt, self.sid.toString(), self.displayName))
+            print("%s │ SID : %s (%s)" % (indent_prompt, self.sid.toString(), self.displayName))
         else:
-            print("%s │ \x1b[93mSID\x1b[0m : \x1b[96m%s\x1b[0m" % (indent_prompt, self.sid.toString()))
-        print(''.join([" │ "]*indent + [" └─"]))  
+            print("%s │ SID : %s" % (indent_prompt, self.sid.toString()))
+        print(''.join([" │ "]*indent + [" └─"]))
+        '''
+        data = []
 
-## ACE
+        # ACESID Header
+        '''
+        data.append({
+            "Field": f"<ACESID at offset 0x{offset:x} (size=0x{self.bytesize:x})>",
+            "Value": ""
+        })
+        '''
 
-class AccessControlObjectTypeFlags(IntFlag):
-    """
-    A set of bit flags that indicate whether the ObjectType and InheritedObjectType members are present. This parameter can be one or more of the following values.
-    
-    https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-access_allowed_object_ace
-    """
-    NONE = 0x00000000 # Neither ObjectType nor InheritedObjectType are valid.
-    ACE_OBJECT_TYPE_PRESENT = 0x00000001 # ObjectType is valid.
-    ACE_INHERITED_OBJECT_TYPE_PRESENT = 0x00000002 # InheritedObjectType is valid. If this value is not specified, all types of child objects can inherit the ACE.
+        # SID with or without displayName
+        '''
+        if self.displayName is not None:
+\
+            data.append({
+                "SID": f"SID",
+                "Value": f"{self.sid.toString()} ({self.displayName})"
 
+        else:
+            data.append({
+                "Field": f"SID",
+                "Value": f"{self.sid.toString()}"
+            })
+        '''
+        data.append({
+                "SID": f"{self.sid.toString()}"
+            })
+        # Convert to DataFrame
+        df = pd.DataFrame(data)
+        #print(df)
+        return(df)
 
 class AccessControlObjectType(object):
     """
@@ -1145,24 +742,73 @@ class AccessControlObjectType(object):
         if self.InheritedObjectTypeGuid is not None:
             properties.append("InheritedObjectTypeGuid")
         padding_len = max([len(p) for p in properties])
+        '''
 
-        print("%s<AccessControlObjectType at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))       
+        print("%s<AccessControlObjectType at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))       
        
-        print("%s │ \x1b[93m%s\x1b[0m : \x1b[96m0x%08x\x1b[0m (\x1b[94m%s\x1b[0m)" % (indent_prompt, "Flags".ljust(padding_len), self.flags.value, self.flags.name))
+        print("%s │ %s : 0x%08x (%s)" % (indent_prompt, "Flags".ljust(padding_len), self.flags.value, self.flags.name))
         
         if self.ObjectTypeGuid is not None:
             if self.ObjectTypeGuid_text is not None:
-                print("%s │ \x1b[93m%s\x1b[0m : \x1b[96m%s\x1b[0m (\x1b[94m%s\x1b[0m)" % (indent_prompt, "ObjectTypeGuid".ljust(padding_len), self.ObjectTypeGuid.toFormatD(), self.ObjectTypeGuid_text))
+                print("%s │ %s : %s (%s)" % (indent_prompt, "ObjectTypeGuid".ljust(padding_len), self.ObjectTypeGuid.toFormatD(), self.ObjectTypeGuid_text))
             else:
-                print("%s │ \x1b[93m%s\x1b[0m : \x1b[96m%s\x1b[0m" % (indent_prompt, "ObjectTypeGuid".ljust(padding_len), self.ObjectTypeGuid.toFormatD()))
+                print("%s │ %s : %s" % (indent_prompt, "ObjectTypeGuid".ljust(padding_len), self.ObjectTypeGuid.toFormatD()))
         
         if self.InheritedObjectTypeGuid is not None:
             if self.InheritedObjectTypeGuid_text is not None:
-                print("%s │ \x1b[93m%s\x1b[0m : \x1b[96m%s\x1b[0m (\x1b[94m%s\x1b[0m)" % (indent_prompt, "InheritedObjectTypeGuid".ljust(padding_len), self.InheritedObjectTypeGuid.toFormatD(), self.InheritedObjectTypeGuid_text))
+                print("%s │ %s : %s (%s)" % (indent_prompt, "InheritedObjectTypeGuid".ljust(padding_len), self.InheritedObjectTypeGuid.toFormatD(), self.InheritedObjectTypeGuid_text))
             else:
-                print("%s │ \x1b[93m%s\x1b[0m : \x1b[96m%s\x1b[0m" % (indent_prompt, "InheritedObjectTypeGuid".ljust(padding_len), self.InheritedObjectTypeGuid.toFormatD()))
+                print("%s │ %s : %s" % (indent_prompt, "InheritedObjectTypeGuid".ljust(padding_len), self.InheritedObjectTypeGuid.toFormatD()))
         
         print(''.join([" │ "]*indent + [" └─"]))
+        '''
+        data = []
+
+        # AccessControlObjectType Header
+        data.append({
+            "Field": f"{indent_prompt}<AccessControlObjectType at offset 0x{offset:x} (size=0x{self.bytesize:x})>",
+            "Value": ""
+        })
+
+        # Flags
+        data.append({
+            "Field": f"{indent_prompt} {'Flags'.ljust(padding_len)}",
+            "Value": f"0x{self.flags.value:08x} ({self.flags.name})"
+        })
+
+        # ObjectTypeGuid (if exists)
+        if self.ObjectTypeGuid is not None:
+            object_type_guid_value = self.ObjectTypeGuid.toFormatD()
+            object_type_guid_text = self.ObjectTypeGuid_text
+            if object_type_guid_text:
+                data.append({
+                    "Field": f"{indent_prompt} {'ObjectTypeGuid'.ljust(padding_len)}",
+                    "Value": f"{object_type_guid_value} ({object_type_guid_text})"
+                })
+            else:
+                data.append({
+                    "Field": f"{indent_prompt} {'ObjectTypeGuid'.ljust(padding_len)}",
+                    "Value": f"{object_type_guid_value}"
+                })
+
+        # InheritedObjectTypeGuid (if exists)
+        if self.InheritedObjectTypeGuid is not None:
+            inherited_object_type_guid_value = self.InheritedObjectTypeGuid.toFormatD()
+            inherited_object_type_guid_text = self.InheritedObjectTypeGuid_text
+            if inherited_object_type_guid_text:
+                data.append({
+                    "Field": f"{'InheritedObjectTypeGuid'.ljust(padding_len)}",
+                    "Value": f"{inherited_object_type_guid_value} ({inherited_object_type_guid_text})"
+                })
+            else:
+                data.append({
+                    "Field": f"{'InheritedObjectTypeGuid'.ljust(padding_len)}",
+                    "Value": f"{inherited_object_type_guid_value}"
+                })
+
+        # Convert to DataFrame
+        df = pd.DataFrame(data)
+        
 
     def resolve_name(self, objectGuid):
         name = None
@@ -1190,60 +836,7 @@ class AccessControlObjectType(object):
 
     def keys(self):
         return self.__data.keys()
-
-
-class AccessMaskFlags(IntFlag):
-    """
-    AccessMaskFlags: Enum class that defines constants for access mask flags.
-
-    This class defines constants for various access mask flags as specified in the Microsoft documentation. These flags represent permissions or rights that can be granted or denied for security principals in access control entries (ACEs) of an access control list (ACL).
-
-    The flags include permissions for creating or deleting child objects, listing contents, reading or writing properties, deleting a tree of objects, and controlling access. Additionally, it includes generic rights like GENERIC_ALL, GENERIC_EXECUTE, GENERIC_WRITE, and GENERIC_READ.
-
-    The values for these flags are derived from the following Microsoft documentation sources:
-    - https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/7a53f60e-e730-4dfe-bbe9-b21b62eb790b
-    - https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/990fb975-ab31-4bc1-8b75-5da132cd4584
-    - https://learn.microsoft.com/en-us/windows/win32/api/iads/ne-iads-ads_rights_enum
-
-    Attributes:
-        DS_CREATE_CHILD (int): Permission to create child objects.
-        DS_DELETE_CHILD (int): Permission to delete child objects.
-        DS_LIST_CONTENTS (int): Permission to list contents.
-        DS_WRITE_PROPERTY_EXTENDED (int): Permission to write properties (extended).
-        DS_READ_PROPERTY (int): Permission to read properties.
-        DS_WRITE_PROPERTY (int): Permission to write properties.
-        DS_DELETE_TREE (int): Permission to delete a tree of objects.
-        DS_LIST_OBJECT (int): Permission to list objects.
-        DS_CONTROL_ACCESS (int): Permission for access control.
-        DELETE (int): Permission to delete.
-        READ_CONTROL (int): Permission to read security descriptor.
-        WRITE_DAC (int): Permission to modify discretionary access control list (DACL).
-        WRITE_OWNER (int): Permission to change the owner.
-        GENERIC_ALL (int): Generic all permissions.
-        GENERIC_EXECUTE (int): Generic execute permissions.
-        GENERIC_WRITE (int): Generic write permissions.
-        GENERIC_READ (int): Generic read permissions.
-    """
-
-    DS_CREATE_CHILD = 0x00000001
-    DS_DELETE_CHILD = 0x00000002
-    DS_LIST_CONTENTS = 0x00000004
-    DS_WRITE_PROPERTY_EXTENDED = 0x00000008
-    DS_READ_PROPERTY = 0x00000010
-    DS_WRITE_PROPERTY = 0x00000020
-    DS_DELETE_TREE = 0x00000040
-    DS_LIST_OBJECT = 0x00000080
-    DS_CONTROL_ACCESS = 0x00000100
-    DELETE = 0x00010000
-    READ_CONTROL = 0x00020000
-    WRITE_DAC = 0x00040000
-    WRITE_OWNER = 0x00080000
-    # Generic rights
-    GENERIC_ALL = 0x10000000
-    GENERIC_EXECUTE = 0x20000000
-    GENERIC_WRITE = 0x40000000
-    GENERIC_READ = 0x80000000
-
+    
 
 class AccessControlMask(object):
     """
@@ -1293,15 +886,33 @@ class AccessControlMask(object):
             self.describe()
 
     def describe(self, offset=0, indent=0):
+        '''
         indent_prompt = " │ " * indent
-        print("%s<AccessControlMask at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))
-        print("%s │ \x1b[93mAccessMask\x1b[0m : \x1b[96m0x%08x\x1b[0m (\x1b[94m%s\x1b[0m)" % (
+        print("%s<AccessControlMask at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))
+        print("%s │ AccessMask : 0x%08x (%s)" % (
                 indent_prompt,
                 self.__data["AccessMask"].value,
                 self.__data["AccessMask"].name
             )
         )
         print(''.join([" │ "]*indent + [" └─"]))
+        '''
+        data = []
+        data.append({"AccessMask":f"{self.__data['AccessMask'].name}"})
+        '''
+        data = {
+            "Field": [
+                f"<AccessControlMask at offset 0x{offset:x} (size=0x{self.bytesize:x})>",
+                "AccessMask"
+            ],
+            "Value": [
+                "",  # 留空給 Header 描述
+                f"0x{self.__data['AccessMask'].value:08x} ({self.__data['AccessMask'].name})"
+            ]
+        }
+        '''
+        df = pd.DataFrame(data)
+        return df
 
     def __getitem__(self, key):
         return self.__data[key]
@@ -1311,40 +922,6 @@ class AccessControlMask(object):
 
     def keys(self):
         return self.__data.keys()
-
-
-class AccessControlEntry_Flags(IntFlag):
-    OBJECT_INHERIT_ACE = 0x01  # Noncontainer child objects inherit the ACE as an effective ACE.
-    CONTAINER_INHERIT_ACE = 0x02  # Child objects that are containers, such as directories, inherit the ACE as an effective ACE. The inherited ACE is inheritable unless the NO_PROPAGATE_INHERIT_ACE bit flag is also set.
-    NO_PROPAGATE_INHERIT_ACE = 0x04  # If the ACE is inherited by a child object, the system clears the OBJECT_INHERIT_ACE and CONTAINER_INHERIT_ACE flags in the inherited ACE. This prevents the ACE from being inherited by subsequent generations of objects.
-    INHERIT_ONLY_ACE = 0x08  # Indicates an inherit-only ACE, which does not control access to the object to which it is attached. If this flag is not set, the ACE is an effective ACE that controls access to the object to which it is attached.
-    INHERITED_ACE = 0x10  # Used to indicate that the ACE was inherited. See section 2.5.3.5 for processing rules for setting this flag.
-    SUCCESSFUL_ACCESS_ACE_FLAG = 0x40  # Used with system-audit ACEs in a system access control list (SACL) to generate audit messages for successful access attempts.
-    FAILED_ACCESS_ACE_FLAG = 0x80  # Used with system-audit ACEs in a system access control list (SACL) to generate audit messages for failed access attempts.
-
-
-class AccessControlEntry_Type(Enum):
-    ACCESS_ALLOWED_ACE_TYPE = 0x00  # Access-allowed ACE that uses the ACCESS_ALLOWED_ACE (section 2.4.4.2) structure.
-    ACCESS_DENIED_ACE_TYPE = 0x01  # Access-denied ACE that uses the ACCESS_DENIED_ACE (section 2.4.4.4) structure.
-    SYSTEM_AUDIT_ACE_TYPE = 0x02  # System-audit ACE that uses the SYSTEM_AUDIT_ACE (section 2.4.4.10) structure.
-    SYSTEM_ALARM_ACE_TYPE = 0x03  # Reserved for future use.
-    ACCESS_ALLOWED_COMPOUND_ACE_TYPE = 0x04  # Reserved for future use.
-    ACCESS_ALLOWED_OBJECT_ACE_TYPE = 0x05  # Object-specific access-allowed ACE that uses the ACCESS_ALLOWED_OBJECT_ACE (section 2.4.4.3) structure.
-    ACCESS_DENIED_OBJECT_ACE_TYPE = 0x06  # Object-specific access-denied ACE that uses the ACCESS_DENIED_OBJECT_ACE (section 2.4.4.5) structure.
-    SYSTEM_AUDIT_OBJECT_ACE_TYPE = 0x07  # Object-specific system-audit ACE that uses the SYSTEM_AUDIT_OBJECT_ACE (section 2.4.4.11) structure.
-    SYSTEM_ALARM_OBJECT_ACE_TYPE = 0x08  # Reserved for future use.
-    ACCESS_ALLOWED_CALLBACK_ACE_TYPE = 0x09  # Access-allowed callback ACE that uses the ACCESS_ALLOWED_CALLBACK_ACE (section 2.4.4.6) structure.
-    ACCESS_DENIED_CALLBACK_ACE_TYPE = 0x0A  # Access-denied callback ACE that uses the ACCESS_DENIED_CALLBACK_ACE (section 2.4.4.7) structure.
-    ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE = 0x0B  # Object-specific access-allowed callback ACE that uses the ACCESS_ALLOWED_CALLBACK_OBJECT_ACE (section 2.4.4.8) structure.
-    ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE = 0x0C  # Object-specific access-denied callback ACE that uses the ACCESS_DENIED_CALLBACK_OBJECT_ACE (section 2.4.4.9) structure.
-    SYSTEM_AUDIT_CALLBACK_ACE_TYPE = 0x0D  # System-audit callback ACE that uses the SYSTEM_AUDIT_CALLBACK_ACE (section 2.4.4.12) structure.
-    SYSTEM_ALARM_CALLBACK_ACE_TYPE = 0x0E  # Reserved for future use.
-    SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE = 0x0F  # Object-specific system-audit callback ACE that uses the SYSTEM_AUDIT_CALLBACK_OBJECT_ACE (section 2.4.4.14) structure.
-    SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE = 0x10  # Reserved for future use.
-    SYSTEM_MANDATORY_LABEL_ACE_TYPE = 0x11  # Mandatory label ACE that uses the SYSTEM_MANDATORY_LABEL_ACE (section 2.4.4.13) structure.
-    SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE = 0x12  # Resource attribute ACE that uses the SYSTEM_RESOURCE_ATTRIBUTE_ACE (section 2.4.4.15).
-    SYSTEM_SCOPED_POLICY_ID_ACE_TYPE = 0x13  # A central policy ID ACE that uses the SYSTEM_SCOPED_POLICY_ID_ACE (section 2.4.4.16).
-
 
 class AccessControlEntry_Header(object):
     """
@@ -1409,6 +986,8 @@ class AccessControlEntry_Header(object):
 
         self.bytesize = 0
 
+        
+
         # Parsing header
         
         self.__data["AceType"] = AccessControlEntry_Type(struct.unpack('<B', rawData.read(1))[0])
@@ -1427,12 +1006,24 @@ class AccessControlEntry_Header(object):
             self.describe()
 
     def describe(self, offset=0, indent=0):
+        '''
         indent_prompt = " │ " * indent
-        print("%s<AccessControlEntry_Header at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))
-        print("%s │ \x1b[93mAceType\x1b[0m  : \x1b[96m0x%02x\x1b[0m (\x1b[94m%s\x1b[0m)" % (indent_prompt, self.__data["AceType"].value, self.__data["AceType"].name))
-        print("%s │ \x1b[93mAceFlags\x1b[0m : \x1b[96m0x%02x\x1b[0m (\x1b[94m%s\x1b[0m)" % (indent_prompt, self.__data["AceFlags"].value, self.__data["AceFlags"].name))
-        print("%s │ \x1b[93mAceSize\x1b[0m  : \x1b[96m0x%04x\x1b[0m" % (indent_prompt, self.__data["AceSize"]))
+        print("%s<AccessControlEntry_Header at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))
+        print("%s │ AceType  : 0x%02x (%s)" % (indent_prompt, self.__data["AceType"].value, self.__data["AceType"].name))
+        print("%s │ AceFlags : 0x%02x (%s)" % (indent_prompt, self.__data["AceFlags"].value, self.__data["AceFlags"].name))
+        print("%s │ AceSize  : 0x%04x" % (indent_prompt, self.__data["AceSize"]))
         print(''.join([" │ "]*indent + [" └─"]))
+        '''
+        data = []
+        
+        data.append({
+        "AceType": f"{self.__data['AceType'].name}",
+        "AceFlags":f"{self.__data['AceFlags'].name}",
+        "AceSize": f"0x{self.__data['AceSize']:04x}"
+        })
+        df = pd.DataFrame(data)
+        #print(df)
+        return df
 
     def __getitem__(self, key):
         return self.__data[key]
@@ -1443,6 +1034,7 @@ class AccessControlEntry_Header(object):
 
 class AccessControlEntry(object):
     def __init__(self, value, ldap_searcher=None, verbose=False):
+        
         self.verbose = verbose
         self.value = value
         self.ldap_searcher = ldap_searcher
@@ -1907,27 +1499,46 @@ class AccessControlEntry(object):
             self.describe()
 
     def describe(self, ace_number=0, offset=0, indent=0):
+        #accessControlEntrydf = pd.DataFrame()
+        # AccessControlEntry struct
+        '''
+
         indent_prompt = " │ " * indent
-        print("%s<AccessControlEntry #%d at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, ace_number, offset, self.bytesize))
-        self.header.describe(offset=offset, indent=(indent + 1))
+        print("%s<AccessControlEntry #%d at offset 0x%x (size=0x%x)>" % (indent_prompt, ace_number, offset, self.bytesize))
+        '''
+        data = []
+        data.append({
+        f"AccessControlEntry":f"#{ace_number}",
+        "offset": f"0x{offset:x}",
+        "size":f"0x{self.bytesize:x}"
+        })
+        df = pd.DataFrame(data)
+        #print(df)
+        headerdf = self.header.describe(offset=offset, indent=(indent + 1))
+        accessControlEntrydf = pd.concat([df,headerdf],axis=1)
+        #print(accessControlEntrydf.to_string())
         offset += self.header.bytesize
         
-        self.mask.describe(offset=offset, indent=(indent + 1))
+        #self.mask.describe(offset=offset, indent=(indent + 1))
+        maskdf = self.mask.describe(offset=offset, indent=(indent + 1))
+        accessControlEntrydf = pd.concat([accessControlEntrydf,maskdf],axis=1)
+        #print(accessControlEntrydf.to_string())
         offset += self.mask.bytesize
                 
         if self.object_type is not None:
-            self.object_type.describe(offset=offset, indent=(indent + 1))
+            #self.object_type.describe(offset=offset, indent=(indent + 1))
+            object_typedf = self.object_type.describe(offset=offset, indent=(indent + 1))
+            accessControlEntrydf = pd.concat([accessControlEntrydf,object_typedf],axis=1)
         
         if self.ace_sid is not None:
-            self.ace_sid.describe(offset=offset, indent=(indent + 1))
+            #self.ace_sid.describe(offset=offset, indent=(indent + 1))
+            ace_siddf = self.ace_sid.describe(offset=offset, indent=(indent + 1))
+            accessControlEntrydf = pd.concat([accessControlEntrydf,ace_siddf],axis=1)
+        
+        #print(accessControlEntrydf.to_string())
+        return accessControlEntrydf
 
-        print(''.join([" │ "]*indent + [" └─"]))
-
-## ACL
-
-class AccessControlList_Revision(Enum):
-    ACL_REVISION = 0x02 
-    ACL_REVISION_DS = 0x04
+        #print(''.join([" │ "]*indent + [" └─"]))
 
 ## SACL
 
@@ -1989,14 +1600,16 @@ class SystemAccessControlList_Header(object):
             self.describe()
 
     def describe(self, offset=0, indent=0):
+        '''
         indent_prompt = " │ " * indent
-        print("%s<SystemAccessControlList_Header at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))
-        print("%s │ \x1b[93mRevision\x1b[0m : \x1b[96m0x%02x\x1b[0m (\x1b[94m%s\x1b[0m)" % (indent_prompt, self.Revision.value, self.Revision.name))
-        print("%s │ \x1b[93mSbz1\x1b[0m     : \x1b[96m0x%02x\x1b[0m" % (indent_prompt, self.__data["Sbz1"]))
-        print("%s │ \x1b[93mAclSize\x1b[0m  : \x1b[96m0x%04x\x1b[0m" % (indent_prompt, self.__data["AclSize"]))
-        print("%s │ \x1b[93mAceCount\x1b[0m : \x1b[96m0x%04x\x1b[0m" % (indent_prompt, self.__data["AceCount"]))
-        print("%s │ \x1b[93mSbz2\x1b[0m     : \x1b[96m0x%04x\x1b[0m" % (indent_prompt, self.__data["Sbz2"]))
+        print("%s<SystemAccessControlList_Header at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))
+        print("%s │ Revision : 0x%02x (%s)" % (indent_prompt, self.Revision.value, self.Revision.name))
+        print("%s │ Sbz1     : 0x%02x" % (indent_prompt, self.__data["Sbz1"]))
+        print("%s │ AclSize  : 0x%04x" % (indent_prompt, self.__data["AclSize"]))
+        print("%s │ AceCount : 0x%04x" % (indent_prompt, self.__data["AceCount"]))
+        print("%s │ Sbz2     : 0x%04x" % (indent_prompt, self.__data["Sbz2"]))
         print(''.join([" │ "]*indent + [" └─"]))
+        '''
 
     def __getitem__(self, key):
         return self.__data[key]
@@ -2043,7 +1656,7 @@ class SystemAccessControlList(object):
 
     def describe(self, offset=0, indent=0):
         indent_prompt = " │ " * indent
-        print("%s<SystemAccessControlList at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))
+        #print("%s<SystemAccessControlList at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))
         self.header.describe(offset=offset, indent=(indent + 1))
         offset += self.header.bytesize
         ace_number = 0
@@ -2051,7 +1664,7 @@ class SystemAccessControlList(object):
             ace_number += 1
             ace.describe(ace_number=ace_number, offset=offset, indent=(indent + 1))
             offset += ace.bytesize
-        print(''.join([" │ "]*indent + [" └─"]))
+        #print(''.join([" │ "]*indent + [" └─"]))
 
     def __getitem__(self, key):
         return self.entries[key]
@@ -2125,14 +1738,63 @@ class DiscretionaryAccessControlList_Header(object):
             self.describe()
 
     def describe(self, offset=0, indent=0):
+        '''
         indent_prompt = " │ " * indent
-        print("%s<DiscretionaryAccessControlList_Header at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))
-        print("%s │ \x1b[93mRevision\x1b[0m : \x1b[96m0x%02x\x1b[0m (\x1b[94m%s\x1b[0m)" % (indent_prompt, self.Revision.value, self.Revision.name))
-        print("%s │ \x1b[93mSbz1\x1b[0m     : \x1b[96m0x%02x\x1b[0m" % (indent_prompt, self.__data["Sbz1"]))
-        print("%s │ \x1b[93mAclSize\x1b[0m  : \x1b[96m0x%04x\x1b[0m" % (indent_prompt, self.__data["AclSize"]))
-        print("%s │ \x1b[93mAceCount\x1b[0m : \x1b[96m0x%04x\x1b[0m" % (indent_prompt, self.__data["AceCount"]))
-        print("%s │ \x1b[93mSbz2\x1b[0m     : \x1b[96m0x%04x\x1b[0m" % (indent_prompt, self.__data["Sbz2"]))
+        print("%s<DiscretionaryAccessControlList_Header at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))
+        print("%s │ Revision : 0x%02x (%s)" % (indent_prompt, self.Revision.value, self.Revision.name))
+        print("%s │ Sbz1     : 0x%02x" % (indent_prompt, self.__data["Sbz1"]))
+        print("%s │ AclSize  : 0x%04x" % (indent_prompt, self.__data["AclSize"]))
+        print("%s │ AceCount : 0x%04x" % (indent_prompt, self.__data["AceCount"]))
+        print("%s │ Sbz2     : 0x%04x" % (indent_prompt, self.__data["Sbz2"]))
         print(''.join([" │ "]*indent + [" └─"]))
+        '''
+        data = []
+        data.append({"Revision":f"{self.Revision.name}",
+                     "Sbz1":f"0x{self.__data["Sbz1"]:02x}",
+                     "AclSize":f"0x{self.__data["AclSize"]:04x}",
+                     "AceCount":f"0x{self.__data["AceCount"]:04x}",
+                     "Sbz2":f"0x{self.__data['Sbz2']:04x}"})
+        '''
+        # DiscretionaryAccessControlList_Header
+        data.append({
+            "Field": f"<DiscretionaryAccessControlList_Header at offset 0x{offset:x} (size=0x{self.bytesize:x})>",
+            "Value": ""
+        })
+
+        # Revision
+        data.append({
+            "Field": f"Revision",
+            "Value": f"0x{self.Revision.value:02x} ({self.Revision.name})"
+        })
+
+        # Sbz1
+        data.append({
+            "Field": f"Sbz1",
+            "Value": f"0x{self.__data["Sbz1"]:02x}"
+        })
+
+        # AclSize
+        data.append({
+            "Field": f"AclSize",
+            "Value": f"0x{self.__data["AclSize"]:04x}"
+        })
+
+        # AceCount
+        data.append({
+            "Field": f"AceCount",
+            "Value": f"0x{self.__data["AceCount"]:04x}"
+        })
+
+        # Sbz2
+        data.append({
+            "Field": f"Sbz2",
+            "Value": f"0x{self.__data['Sbz2']:04x}"
+        })
+        '''
+
+        # Convert to DataFrame
+        df = pd.DataFrame(data)
+        print(df)
 
     def __getitem__(self, key):
         return self.__data[key]
@@ -2154,6 +1816,7 @@ class DiscretionaryAccessControlList(object):
         self.header = None
         self.entries = []
         self.ldap_searcher = ldap_searcher
+        self.dataframe = None
         #
         self.parse()
 
@@ -2178,16 +1841,29 @@ class DiscretionaryAccessControlList(object):
             self.describe()
 
     def describe(self, offset=0, indent=0):
-        indent_prompt = " │ " * indent
-        print("%s<DiscretionaryAccessControlList at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))
-        self.header.describe(offset=offset, indent=(indent + 1))
+        #indent_prompt = " │ " * indent
+        
+        #print("%s<DiscretionaryAccessControlList at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))
+        #self.header.describe(offset=offset, indent=(indent + 1))
         offset += self.header.bytesize
         ace_number = 0
+        '''
+        data = []
+        data.append({
+        "Field": f"<DiscretionaryAccessControlList #{ace_number} at offset 0x{offset:x} (size=0x{self.bytesize:x})>",
+        "Value": ""
+        })
+        df = pd.DataFrame(data)
+        print(df)
+        '''
         for ace in self.entries:
             ace_number += 1
-            ace.describe(ace_number=ace_number, offset=offset, indent=(indent + 1))
+            self.dataframe = pd.concat([self.dataframe,ace.describe(ace_number=ace_number, offset=offset, indent=(indent + 1))],axis=0, ignore_index=True)
             offset += ace.bytesize
-        print(''.join([" │ "]*indent + [" └─"]))
+        
+        #print(self.dataframe.to_string)
+        return self.dataframe
+        #print(''.join([" │ "]*indent + [" └─"]))
 
     def __getitem__(self, key):
         return self.entries[key]
@@ -2265,16 +1941,34 @@ class NTSecurityDescriptor_Header(object):
             self.describe()
 
     def describe(self, offset=0, indent=0):
-        indent_prompt = " │ " * indent
-        print("%s<NTSecurityDescriptor_Header at offset \x1b[95m0x%x\x1b[0m (size=\x1b[95m0x%x\x1b[0m)>" % (indent_prompt, offset, self.bytesize))
-        print("%s │ \x1b[93mRevision\x1b[0m    : \x1b[96m0x%02x\x1b[0m" % (indent_prompt, self.__data["Revision"]))
-        print("%s │ \x1b[93mSbz1\x1b[0m        : \x1b[96m0x%02x\x1b[0m" % (indent_prompt, self.__data["Sbz1"]))
-        print("%s │ \x1b[93mControl\x1b[0m     : \x1b[96m0x%04x\x1b[0m" % (indent_prompt, self.__data["Control"]))
-        print("%s │ \x1b[93mOffsetOwner\x1b[0m : \x1b[96m0x%08x\x1b[0m" % (indent_prompt, self.__data["OffsetOwner"]))
-        print("%s │ \x1b[93mOffsetGroup\x1b[0m : \x1b[96m0x%08x\x1b[0m" % (indent_prompt, self.__data["OffsetGroup"]))
-        print("%s │ \x1b[93mOffsetSacl\x1b[0m  : \x1b[96m0x%08x\x1b[0m" % (indent_prompt, self.__data["OffsetSacl"]))
-        print("%s │ \x1b[93mOffsetDacl\x1b[0m  : \x1b[96m0x%08x\x1b[0m" % (indent_prompt, self.__data["OffsetDacl"]))
+        #indent_prompt = " │ " * indent
+        data = {
+        "Field": ["Header at offset", "Revision", "Sbz1", "Control", "OffsetOwner", "OffsetGroup", "OffsetSacl", "OffsetDacl"],
+        "Value": [
+            f"<NTSecurityDescriptor_Header at offset 0x{offset:x} (size=0x{self.bytesize:x})>",
+            f"0x{self.__data['Revision']:02x}",
+            f"0x{self.__data['Sbz1']:02x}",
+            f"0x{self.__data['Control']:04x}",
+            f"0x{self.__data['OffsetOwner']:08x}",
+            f"0x{self.__data['OffsetGroup']:08x}",
+            f"0x{self.__data['OffsetSacl']:08x}",
+            f"0x{self.__data['OffsetDacl']:08x}"
+        ]
+    
+        }
+        df = pd.DataFrame(data)
+        print(df)
+        '''
+        print("%s<NTSecurityDescriptor_Header at offset 0x%x (size=0x%x)>" % (indent_prompt, offset, self.bytesize))
+        print("%s │ Revision    : 0x%02x" % (indent_prompt, self.__data["Revision"]))
+        print("%s │ Sbz1        : 0x%02x" % (indent_prompt, self.__data["Sbz1"]))
+        print("%s │ Control     : 0x%04x" % (indent_prompt, self.__data["Control"]))
+        print("%s │ OffsetOwner : 0x%08x" % (indent_prompt, self.__data["OffsetOwner"]))
+        print("%s │ OffsetGroup : 0x%08x" % (indent_prompt, self.__data["OffsetGroup"]))
+        print("%s │ OffsetSacl  : 0x%08x" % (indent_prompt, self.__data["OffsetSacl"]))
+        print("%s │ OffsetDacl  : 0x%08x" % (indent_prompt, self.__data["OffsetDacl"]))
         print(''.join([" │ "]*indent + [" └─"]))
+        '''
 
     def __getitem__(self, key):
         return self.__data[key]
@@ -2289,6 +1983,7 @@ class NTSecurityDescriptor_Header(object):
 class NTSecurityDescriptor(object):
     def __init__(self, value, ldap_searcher=None, verbose=False):
         self.value = value
+        #print(self.value)
         # Properties of this section
         self.header = None
         self.dacl = None
@@ -2350,264 +2045,43 @@ class NTSecurityDescriptor(object):
             self.describe()
 
     def describe(self, offset=0, indent=0):
-        print("<NTSecurityDescriptor>")
-        self.header.describe(offset=offset, indent=indent+1)
+        #print("<NTSecurityDescriptor>")
+        #self.header.describe(offset=offset, indent=indent+1)
         offset += self.header.bytesize
         if self.header.OffsetDacl < self.header.OffsetSacl:
             # Print DACL
             if self.dacl is not None:
                 self.dacl.describe(offset=self.header.OffsetDacl, indent=indent+1)
             else:
-                print("%s<DiscretionaryAccessControlList is \x1b[91mnot present\x1b[0m>" % (" │ " * (indent+1)))
-                print("%s └─" % (" │ " * (indent+1)))
+                #print("%s<DiscretionaryAccessControlList is not present>" % (" │ " * (indent+1)))
+                print("DiscretionaryAccessControlList is not present")
+                #print("%s └─" % (" │ " * (indent+1)))
             # Print SACL
+            '''
             if self.sacl is not None:
                 self.sacl.describe(offset=self.header.OffsetSacl, indent=indent+1)
             else:
-                print("%s<SystemAccessControlList is \x1b[91mnot present\x1b[0m>" % (" │ " * (indent+1)))
-                print("%s └─" % (" │ " * (indent+1)))
+                #print("%s<SystemAccessControlList is not present>" % (" │ " * (indent+1)))
+                print("SystemAccessControlList is not present>")
+                #print("%s └─" % (" │ " * (indent+1)))
+            '''
         else:
             # Print SACL
+            '''
             if self.sacl is not None:
                 self.sacl.describe(offset=self.header.OffsetSacl, indent=indent+1)
             else:
-                print("%s<SystemAccessControlList is \x1b[91mnot present\x1b[0m>" % (" │ " * (indent+1)))
-                print("%s └─" % (" │ " * (indent+1)))
+                #print("%s<SystemAccessControlList is not present>" % (" │ " * (indent+1)))
+                print("SystemAccessControlList is not present>")
+                #print("%s └─" % (" │ " * (indent+1)))
+             '''
             # Print DACL
             if self.dacl is not None:
-                self.dacl.describe(offset=self.header.OffsetDacl, indent=indent+1)
+                return self.dacl.describe(offset=self.header.OffsetDacl, indent=indent+1)
             else:
-                print("%s<DiscretionaryAccessControlList is \x1b[91mnot present\x1b[0m>" % (" │ " * (indent+1)))
-                print("%s └─" % (" │ " * (indent+1)))
-        print(" └─")
+                #print("%s<DiscretionaryAccessControlList is not present>" % (" │ " * (indent+1)))
+                print("<DiscretionaryAccessControlList is not present>")
+                #print("%s └─" % (" │ " * (indent+1)))
+        #print(" └─")
 
 
-class HumanDescriber(object):
-    def __init__(self, ntsd, verbose=False):
-        self.verbose = verbose
-        self.ntsd = ntsd
-
-    def summary(self):
-        print("Other objects have the following rights on this object:")
-
-        # Iterate on DACL entries
-        entry_id = 0
-        for ace in self.ntsd.dacl.entries:
-            entry_id += 1
-            self.explain_ace(ace=ace, entry_id=entry_id)
-
-    def explain_ace(self, ace, entry_id=0):
-        # Checking allowed rights
-        if ace.header.AceType in [
-            AccessControlEntry_Type.ACCESS_ALLOWED_ACE_TYPE, 
-            AccessControlEntry_Type.ACCESS_ALLOWED_OBJECT_ACE_TYPE
-        ]:
-            if ace.ace_sid is not None:
-                if ace.ace_sid.displayName is not None:
-                    identityDisplayName = ace.ace_sid.displayName
-                else:
-                    identityDisplayName = ace.ace_sid.sid
-
-                # Parse rights
-                str_rights = self.explain_access_mask(ace=ace)
-
-                # Parse target
-                str_target = "me"
-                if ace.object_type is not None:
-                    if ace.object_type.ObjectTypeGuid_text is not None:
-                        str_target = "my " + ace.object_type.ObjectTypeGuid_text
-                    elif ace.object_type.ObjectTypeGuid is not None:
-                        str_target = ace.object_type.ObjectTypeGuid.toFormatD()
-                else:
-                    str_target = "me"
-
-                str_inheritedtarget = None
-                if ace.object_type is not None:
-                    if ace.object_type.InheritedObjectTypeGuid_text is not None:
-                        str_inheritedtarget = ace.object_type.InheritedObjectTypeGuid_text
-                        str_target += " (inherited from the %s)" % str_inheritedtarget 
-                    elif ace.object_type.InheritedObjectTypeGuid is not None:
-                        str_inheritedtarget = ace.object_type.InheritedObjectTypeGuid.toFormatD()
-                        str_target += " (inherited from the object %s)" % str_inheritedtarget 
-                else:
-                    str_inheritedtarget = None
-
-                # Check inheritance
-                if (ace.header.AceFlags & AccessControlEntry_Flags.INHERITED_ACE):
-                    print("%03d. '\x1b[94m%s\x1b[0m' is \x1b[92mallowed\x1b[0m to \x1b[93m%s\x1b[0m on \x1b[95m%s\x1b[0m" % (entry_id, identityDisplayName, str_rights, str_target))
-                else:
-                    print("%03d. '\x1b[94m%s\x1b[0m' is \x1b[92mallowed\x1b[0m to \x1b[93m%s\x1b[0m on \x1b[95m%s\x1b[0m, by inheritance." % (entry_id, identityDisplayName, str_rights, str_target))
-            else:
-                print("%03d. \x1b[91mUNHANDLED\x1b[0m" % (entry_id))
-        else:
-            print("%03d. \x1b[91mUNHANDLED ace type '%s'\x1b[0m" % (entry_id, ace.header.AceType.name))
-
-    def explain_access_mask(self, ace):
-        mapping = {
-            "DS_CREATE_CHILD": "Create Child",
-            "DS_DELETE_CHILD": "Delete Child",
-            "DS_LIST_CONTENTS": "List Contents",
-            "DS_WRITE_PROPERTY_EXTENDED": "Write Extended Properties",
-            "DS_READ_PROPERTY": "Read",
-            "DS_WRITE_PROPERTY": "Write",
-            "DS_DELETE_TREE": "Delete Tree",
-            "DS_LIST_OBJECT": "List Object",
-            "DS_CONTROL_ACCESS": "Control Access",
-            "DELETE": "Delete",
-            "READ_CONTROL": "Read Control",
-            "WRITE_DAC": "Write Dac",
-            "WRITE_OWNER": "Write Owner",
-            "GENERIC_ALL": "Generic All",
-            "GENERIC_EXECUTE": "Generic Execute",
-            "GENERIC_WRITE": "Generic Write",
-            "GENERIC_READ": "Generic Read"
-        }
-        rights = []
-        access_flags = list(AccessMaskFlags(ace.mask.AccessMask))
-        for flag in access_flags:
-            rights.append(mapping[flag.name])
-        
-        return "%s" % ', '.join(rights)
-
-
-def parseArgs():
-    print("DescribeNTSecurityDescriptor.py v%s - by @podalirius_\n" % VERSION)
-
-    parser = argparse.ArgumentParser(add_help=True, description="Parse and describe the contents of a raw ntSecurityDescriptor structure")
-
-    parser.add_argument("-V", "--verbose", default=False, action="store_true", help="Verbose mode. (default: False)")
-    
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument("-v", "--value", default=None, type=str, help="The value to be described by the NTSecurityDescriptor")
-    source.add_argument("-D", "--distinguishedName", default=None, type=str, help="The distinguishedName of the object to be described by the NTSecurityDescriptor")
-    
-    parser.add_argument("--use-ldaps", action="store_true", default=False, help="Use LDAPS instead of LDAP")
-
-    parser.add_argument("--summary", action="store_true", default=False, help="Generate a human readable summary of the rights.")
-    parser.add_argument("--describe", action="store_true", default=False, help="Describe the raw structure.")
-
-    authconn = parser.add_argument_group("authentication & connection")
-    authconn.add_argument("--dc-ip", action="store", metavar="ip address", help="IP Address of the domain controller or KDC (Key Distribution Center) for Kerberos. If omitted it will use the domain part (FQDN) specified in the identity parameter")
-    authconn.add_argument("--kdcHost", dest="kdcHost", action="store", metavar="FQDN KDC", help="FQDN of KDC for Kerberos.")
-    authconn.add_argument("-d", "--domain", dest="auth_domain", metavar="DOMAIN", action="store", help="(FQDN) domain to authenticate to")
-    authconn.add_argument("-u", "--user", dest="auth_username", metavar="USER", action="store", help="user to authenticate with")
-
-    secret = parser.add_argument_group()
-    cred = secret.add_mutually_exclusive_group()
-    cred.add_argument("--no-pass", action="store_true", help="don\"t ask for password (useful for -k)")
-    cred.add_argument("-p", "--password", dest="auth_password", metavar="PASSWORD", action="store", help="password to authenticate with")
-    cred.add_argument("-H", "--hashes", dest="auth_hashes", action="store", metavar="[LMHASH:]NTHASH", help="NT/LM hashes, format is LMhash:NThash")
-    cred.add_argument("--aes-key", dest="auth_key", action="store", metavar="hex key", help="AES key to use for Kerberos Authentication (128 or 256 bits)")
-    secret.add_argument("-k", "--kerberos", dest="use_kerberos", action="store_true", help="Use Kerberos authentication. Grabs credentials from .ccache file (KRB5CCNAME) based on target parameters. If valid credentials cannot be found, it will use the ones specified in the command line")
-    
-    if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(1)
-    
-    options = parser.parse_args()
-    
-    if options.summary == False and options.describe == False:
-        parser.print_help()
-        print("\n[+] At least one option of --summary and/or --describe is needed.\n")
-        sys.exit(1)
-
-    if options.auth_username is not None:
-        if options.auth_password is None and options.no_pass == False and options.auth_hashes is None:
-            print("[+] No password of hashes provided and --no-pass is '%s'" % options.no_pass)
-            from getpass import getpass
-            if options.auth_domain is not None:
-                options.auth_password = getpass("  | Provide a password for '%s\\%s':" % (options.auth_domain, options.auth_username))
-            else:
-                options.auth_password = getpass("  | Provide a password for '%s':" % options.auth_username)
-
-    return options
-
-
-if __name__ == "__main__":
-    options = parseArgs()
-
-    ls = None
-    if options.auth_username is not None:
-        # Parse hashes
-        auth_lm_hash = ""
-        auth_nt_hash = ""
-        if options.auth_hashes is not None:
-            if ":" in options.auth_hashes:
-                auth_lm_hash = options.auth_hashes.split(":")[0]
-                auth_nt_hash = options.auth_hashes.split(":")[1]
-            else:
-                auth_nt_hash = options.auth_hashes
-        
-        # Use AES Authentication key if available
-        if options.auth_key is not None:
-            options.use_kerberos = True
-        if options.use_kerberos is True and options.kdcHost is None:
-            print("[!] Specify KDC's Hostname of FQDN using the argument --kdcHost")
-            exit()
-
-        # Try to authenticate with specified credentials
-        print("[>] Try to authenticate as '%s\\%s' on %s ... " % (options.auth_domain, options.auth_username, options.dc_ip))
-        ldap_server, ldap_session = init_ldap_session(
-            auth_domain=options.auth_domain,
-            auth_dc_ip=options.dc_ip,
-            auth_username=options.auth_username,
-            auth_password=options.auth_password,
-            auth_lm_hash=auth_lm_hash,
-            auth_nt_hash=auth_nt_hash,
-            auth_key=options.auth_key,
-            use_kerberos=options.use_kerberos,
-            kdcHost=options.kdcHost,
-            use_ldaps=options.use_ldaps
-        )
-        print("[+] Authentication successful!\n")
-        ls = LDAPSearcher(
-            ldap_server=ldap_server,
-            ldap_session=ldap_session
-        )
-        ls.generate_guid_map_from_ldap()
-
-    raw_ntsd_value = None
-    # Read value from the LDAP
-    if options.distinguishedName is not None and ls is not None:
-        print("[+] Loading ntSecurityDescriptor from the LDAP object '%s'" % options.distinguishedName)
-        try:
-            results = {}
-            results = ls.query(
-                base_dn=options.distinguishedName,
-                query="(distinguishedName=%s)" % options.distinguishedName.lower(),
-                attributes=["ntSecurityDescriptor"]
-            )
-        except Exception as e:
-            print("[!] Error: %s" % e)
-
-        if len(results.keys()) != 0:
-            raw_ntsd_value = results[options.distinguishedName.lower()]["ntSecurityDescriptor"]
-            print("[+] ntSecurityDescriptor is loaded!")
-        else:
-            print("[!] Could not find an object with the distinguishedName '%s'" % options.distinguishedName)
-
-    # Read value from a file
-    elif options.value is not None:
-        if os.path.isfile(options.value):
-            print("[+] Loading ntSecurityDescriptor from file '%s'" % options.value)
-            filename = options.value
-            raw_ntsd_value = open(filename, 'r').read().strip()
-        if re.compile(r'^[0-9a-fA-F]+$').match(raw_ntsd_value):
-            raw_ntsd_value = binascii.unhexlify(raw_ntsd_value)
-
-    # Parse value
-    if raw_ntsd_value is not None:
-        ntsd = NTSecurityDescriptor(
-            value=raw_ntsd_value, 
-            verbose=options.verbose,
-            ldap_searcher=ls
-        )
-        if options.verbose:
-            print("[>] Final result " + "".center(80,"="))
-
-        if options.describe or options.verbose:
-            ntsd.describe()
-
-        if options.summary or options.verbose:
-            print("\n" + "==[Summary]".ljust(80,'=') + "\n")
-            HumanDescriber(ntsd=ntsd).summary()
